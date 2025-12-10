@@ -1,0 +1,1188 @@
+#include "Arena.h"
+#include <iostream>
+#include <filesystem>
+#include <random>
+#include <cstdlib>
+
+using namespace std;
+
+Arena::Arena(int rows, int cols) : m_rows(rows), m_cols(cols) {
+    board.resize(rows, vector<ObstacleType>(cols, ObstacleType::Empty));
+    placeObstacles();
+}
+
+Arena::~Arena() {
+    for (auto& lr : robots) {
+        if (lr.robot) delete lr.robot;
+        if (lr.handle) dlclose(lr.handle);
+    }
+}
+
+bool Arena::inBounds(int r, int c) const {
+    return r >= 0 && r < m_rows && c >= 0 && c < m_cols;
+}
+
+const LoadedRobot* Arena::robotAt(int r, int c) const {
+    for (const auto& lr : robots)
+        if (lr.row == r && lr.col == c && lr.alive)
+            return &lr;
+    return nullptr;
+}
+
+// ---------------- OBSTACLES ------------------
+void Arena::placeObstacles() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dist(0, 99);
+
+    for (int r = 0; r < m_rows; r++) {
+        for (int c = 0; c < m_cols; c++) {
+
+            int roll = dist(gen);
+
+            if (roll < 3)
+                board[r][c] = ObstacleType::FlameTrap;
+            else if (roll < 5)
+                board[r][c] = ObstacleType::Pit;
+            else if (roll < 8)
+                board[r][c] = ObstacleType::Mound;
+        }
+    }
+}
+
+// ---------------- ROBOT LOADING ------------------
+void Arena::compileRobot(const string& file) {
+    string name = file.substr(0, file.find(".cpp"));
+    string sofile = "lib" + name + ".so";
+
+    string cmd =
+        "g++ -shared -fPIC -std=c++20 -o " + sofile + " " + file + " RobotBase.o -I.";
+
+    cout << "Compiling " << file << "...\n";
+    system(cmd.c_str());
+}
+
+RobotBase* Arena::loadRobotSO(const string& sofile, void*& handle) {
+    handle = dlopen(sofile.c_str(), RTLD_LAZY);
+    if (!handle) {
+        cerr << "Failed to load " << sofile << ": " << dlerror() << "\n";
+        return nullptr;
+    }
+
+    RobotFactory create_robot = (RobotFactory)dlsym(handle, "create_robot");
+    if (!create_robot) {
+        cerr << "Missing create_robot() in " << sofile << "\n";
+        dlclose(handle);
+        return nullptr;
+    }
+    return create_robot();
+}
+
+// Find all Robot_*.cpp and load
+void Arena::loadAllRobots() {
+    namespace fs = std::filesystem;
+
+    for (const auto& f : fs::directory_iterator(".")) {
+        if (!f.is_regular_file()) continue;
+
+        string name = f.path().filename().string();
+
+        if (name.rfind("Robot_", 0) == 0 && name.ends_with(".cpp")) {
+            compileRobot(name);
+
+            string sofile = "lib" + name.substr(0, name.find(".cpp")) + ".so";
+            LoadedRobot lr;
+
+            lr.robot = loadRobotSO(sofile, lr.handle);
+            if (!lr.robot) continue;
+
+            lr.robot->set_boundaries(m_rows, m_cols);
+            robots.push_back(lr);
+        }
+    }
+
+    placeRobotsRandomly();
+}
+
+// ---------------- PLACE ROBOTS ------------------
+void Arena::placeRobotsRandomly() {
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<> distR(0, m_rows - 1);
+    uniform_int_distribution<> distC(0, m_cols - 1);
+
+    for (auto& lr : robots) {
+        while (true) {
+            int r = distR(gen);
+            int c = distC(gen);
+
+            if (!robotAt(r, c) && board[r][c] == ObstacleType::Empty) {
+                lr.row = r;
+                lr.col = c;
+                lr.robot->move_to(r, c);
+                break;
+            }
+        }
+    }
+}
+
+// ------------------ RADAR --------------------
+vector<RadarObj> Arena::buildRadar(const LoadedRobot& lr) const {
+    vector<RadarObj> v;
+
+    for (int r = 0; r < m_rows; r++) {
+        for (int c = 0; c < m_cols; c++) {
+            char type = '.';
+
+            if (robotAt(r, c))
+                type = 'R';
+            else {
+                switch (board[r][c]) {
+                case ObstacleType::FlameTrap: type = 'F'; break;
+                case ObstacleType::Pit: type = 'P'; break;
+                case ObstacleType::Mound: type = 'M'; break;
+                default: break;
+                }
+            }
+            v.emplace_back(type, r, c);
+        }
+    }
+
+    return v;
+}
+
+// ------------------ MOVEMENT --------------------
+void Arena::doMovement(LoadedRobot& lr) {
+    if (!lr.alive) return;
+
+    int dir = 0, dist = 0;
+    lr.robot->get_move_direction(dir, dist);
+
+    if (dist == 0 || dir == 0) return;
+
+    auto [dr, dc] = directions[dir];
+
+    for (int i = 0; i < dist; i++) {
+        int nr = lr.row + dr;
+        int nc = lr.col + dc;
+
+        if (!inBounds(nr, nc)) break;
+
+        if (robotAt(nr, nc)) break;
+
+        if (board[nr][nc] == ObstacleType::Mound) break;
+
+        lr.row = nr;
+        lr.col = nc;
+        lr.robot->move_to(nr, nc);
+
+        // Pit? robot stuck permanently
+        if (board[nr][nc] == ObstacleType::Pit) {
+            lr.robot->disable_movement();
+            break;
+        }
+
+        // Flame trap damage
+        if (board[nr][nc] == ObstacleType::FlameTrap) {
+            applyDamage(lr, WeaponType::flamethrower);
+        }
+    }
+}
+
+// ------------------ SHOOTING --------------------
+void Arena::applyDamage(LoadedRobot& target, WeaponType w) {
+    if (!target.alive) return;
+
+    int base = 10;
+    if (w == WeaponType::railgun) base = 15;
+    if (w == WeaponType::hammer) base = 20;
+    if (w == WeaponType::flamethrower) base = 12;
+    if (w == WeaponType::grenade) base = 18;
+
+    if (target.robot->get_armor() > 0) {
+        target.robot->reduce_armor(1);
+        base -= 4;
+    }
+    if (base < 1) base = 1;
+
+    int newHP = target.robot->take_damage(base);
+    if (newHP <= 0) target.alive = false;
+}
+
+void Arena::doShooting(LoadedRobot& lr) {
+    if (!lr.alive) return;
+
+    int sr, sc;
+    if (!lr.robot->get_shot_location(sr, sc)) return;
+
+    WeaponType w = lr.robot->get_weapon();
+
+    // ----- Flamethrower -----
+    if (w == WeaponType::flamethrower) {
+        int r0 = lr.row, c0 = lr.col;
+
+        for (int dr = -1; dr <= 1; dr++) {
+            for (int i = 1; i <= 4; i++) {
+                int nr = r0 + i;
+                int nc = c0 + dr;
+                if (inBounds(nr, nc)) {
+                    if (auto* t = robotAt(nr, nc)) {
+                        applyDamage(*t, w);
+                    }
+                }
+            }
+        }
+    }
+
+    // ----- Hammer -----
+    else if (w == WeaponType::hammer) {
+        if (LoadedRobot* t = robotAt(sr, sc)) {
+            applyDamage(*t, w);
+        }
+    }
+
+    // ----- Railgun -----
+    else if (w == WeaponType::railgun) {
+        int r0 = lr.row, c0 = lr.col;
+
+        int dr = (sr > r0) ? 1 : (sr < r0 ? -1 : 0);
+        int dc = (sc > c0) ? 1 : (sc < c0 ? -1 : 0);
+
+        int r = r0 + dr, c = c0 + dc;
+        while (inBounds(r, c)) {
+            if (auto* t = robotAt(r, c)) applyDamage(*t, w);
+            r += dr;
+            c += dc;
+        }
+    }
+
+    // ----- Grenade -----
+    else if (w == WeaponType::grenade) {
+        if (lr.robot->get_grenades() == 0) return;
+
+        lr.robot->decrement_grenades();
+
+        for (int dr = -1; dr <= 1; dr++)
+            for (int dc = -1; dc <= 1; dc++)
+                if (inBounds(sr + dr, sc + dc))
+                    if (auto* t = robotAt(sr + dr, sc + dc))
+                        applyDamage(*t, w);
+    }
+}
+
+// ------------------ BOARD PRINTING -----------------
+void Arena::printBoard(int round) const {
+    cout << "\n=========== ROUND " << round << " ===========\n";
+    cout << "   ";
+    for (int c = 0; c < m_cols; c++) cout << c % 10 << " ";
+    cout << "\n";
+
+    for (int r = 0; r < m_rows; r++) {
+        cout << (r < 10 ? " " : "") << r << " ";
+        for (int c = 0; c < m_cols; c++) {
+            const LoadedRobot* rob = nullptr;
+            for (auto& lr : robots)
+                if (lr.row == r && lr.col == c && lr.alive)
+                    rob = &lr;
+
+            if (rob) cout << 'R' << " ";
+            else if (board[r][c] == ObstacleType::FlameTrap) cout << "F ";
+            else if (board[r][c] == ObstacleType::Pit) cout << "P ";
+            else if (board[r][c] == ObstacleType::Mound) cout << "M ";
+            else cout << ". ";
+        }
+        cout << "\n";
+    }
+}
+
+// ------------------ SIMULATION LOOP -----------------
+bool Arena::gameOver() const {
+    int aliveCount = 0;
+    for (auto& lr : robots)
+        if (lr.alive) aliveCount++;
+    return aliveCount <= 1;
+}
+
+void Arena::runSimulation() {
+    int round = 0;
+    while (!gameOver() && round < 500) {
+        printBoard(round);
+
+        for (auto& lr : robots) {
+            if (!lr.alive) continue;
+
+            // Radar
+            auto radar = buildRadar(lr);
+            int dir;
+            lr.robot->get_radar_direction(dir);
+            lr.robot->process_radar_results(radar);
+
+            doMovement(lr);
+            doShooting(lr);
+        }
+
+        round++;
+    }
+
+    printBoard(round);
+    cout << "\n===== GAME OVER =====\n";
+
+    for (auto& lr : robots)
+        if (lr.alive)
+            cout << "WINNER: " << lr.robot->print_stats() << "\n";
+}
+
+#include "RobotBase.h"
+#include <cstdlib>
+#include <ctime>
+#include <set>
+#include <cmath>
+#include <limits>
+#include <utility>
+
+class Robot_Flame_e_o : public RobotBase 
+{
+private:
+    bool target_found = false;
+    int target_row = -1;
+    int target_col = -1;
+
+    int radar_direction = 1; // Radar scanning direction (1-8)
+    bool fixed_radar = false; // Tracks whether radar is locked on a target
+    const int max_range = 4; // Maximum range of the flamethrower
+    std::set<std::pair<int, int>> obstacles_memory; // Memory of obstacles
+
+    // Helper function to calculate Manhattan distance
+    int calculate_distance(int row1, int col1, int row2, int col2) const 
+    {
+        return std::abs(row1 - row2) + std::abs(col1 - col2);
+    }
+
+    // Find the closest enemy from the radar results
+    void find_closest_enemy(const std::vector<RadarObj>& radar_results, int current_row, int current_col) 
+    {
+        target_found = false;
+        int closest_distance = std::numeric_limits<int>::max();
+
+        for (const auto& obj : radar_results) 
+        {
+            if (obj.m_type == 'R') // Enemy robot
+            {
+                int distance = calculate_distance(current_row, current_col, obj.m_row, obj.m_col);
+                if (distance <= max_range && distance < closest_distance) 
+                {
+                    closest_distance = distance;
+                    target_row = obj.m_row;
+                    target_col = obj.m_col;
+                    target_found = true;
+                    fixed_radar = true; // Lock the radar on this direction
+                }
+            }
+        }
+    }
+
+    // Update the memory of obstacles
+    void update_obstacle_memory(const std::vector<RadarObj>& radar_results) 
+    {
+        for (const auto& obj : radar_results) 
+        {
+            if (obj.m_type == 'M' || obj.m_type == 'P' || obj.m_type == 'F') 
+            {
+                obstacles_memory.insert({obj.m_row, obj.m_col});
+            }
+        }
+    }
+
+    // Check if a cell is passable
+    bool is_passable(int row, int col) const 
+    {
+        return obstacles_memory.find({row, col}) == obstacles_memory.end();
+    }
+
+public:
+    Robot_Flame_e_o() : RobotBase(2, 5, flamethrower) 
+    {
+        std::srand(static_cast<unsigned int>(std::time(nullptr))); // Seed for random movement
+    }
+
+    // Set the radar direction for scanning
+    virtual void get_radar_direction(int& radar_direction_out) override 
+    {
+        if (fixed_radar && target_found) 
+        {
+            // Keep scanning the same direction if a target is found
+            radar_direction_out = radar_direction;
+        } 
+        else 
+        {
+            // Cycle through radar directions (1-8) if no target
+            radar_direction_out = radar_direction;
+            radar_direction = (radar_direction % 8) + 1; // Increment and wrap around
+        }
+    }
+
+    // Process the radar results and update the target and obstacles
+    virtual void process_radar_results(const std::vector<RadarObj>& radar_results) override 
+    {
+        target_found = false; // Reset target state
+        int current_row, current_col;
+        get_current_location(current_row, current_col);
+
+        // Update obstacle memory
+        update_obstacle_memory(radar_results);
+
+        // Look for the closest enemy in the radar results
+        find_closest_enemy(radar_results, current_row, current_col);
+
+        if (!target_found) 
+        {
+            fixed_radar = false; // Unlock radar if no target is found
+        }
+    }
+
+    // Get the location for shooting, if applicable
+    virtual bool get_shot_location(int& shot_row, int& shot_col) override 
+    {
+        if (target_found) 
+        {
+            int current_row, current_col;
+            get_current_location(current_row, current_col);
+
+            // Check if target is within range
+            if (calculate_distance(current_row, current_col, target_row, target_col) <= max_range) 
+            {
+                // Shoot at the target
+                shot_row = target_row;
+                shot_col = target_col;
+                return true;
+            } 
+            else 
+            {
+                // Target is out of range
+                target_found = false;
+                fixed_radar = false;
+            }
+        }
+
+        return false; // No valid target to shoot
+    }
+
+    // Get the movement direction and distance
+    virtual void get_move_direction(int& move_direction, int& move_distance) override 
+    {
+        int current_row, current_col;
+        get_current_location(current_row, current_col);
+
+        if (target_found) 
+        {
+            // Move toward the target while avoiding obstacles
+            int row_step = (target_row > current_row) ? 1 : (target_row < current_row) ? -1 : 0;
+            int col_step = (target_col > current_col) ? 1 : (target_col < current_col) ? -1 : 0;
+
+            // Prioritize row movement, then column movement
+            if (is_passable(current_row + row_step, current_col)) 
+            {
+                move_direction = (row_step > 0) ? 5 : 1; // Down or Up
+                move_distance = 1;
+            } 
+            else if (is_passable(current_row, current_col + col_step)) 
+            {
+                move_direction = (col_step > 0) ? 3 : 7; // Right or Left
+                move_distance = 1;
+            } 
+            else 
+            {
+                // Stay in place if movement is blocked
+                move_direction = 0;
+                move_distance = 0;
+            }
+
+            return;
+        }
+
+        // Random movement if no target is found
+        move_direction = (std::rand() % 8) + 1; // Random direction (1-8)
+        move_distance = 1; // Move 1 space
+    }
+};
+
+// Factory function to create Robot_Flame_e_o
+extern "C" RobotBase* create_robot() 
+{
+    return new Robot_Flame_e_o();
+}#include "RobotBase.h"
+#include <vector>
+#include <iostream>
+#include <algorithm> // For std::find_if
+
+class Robot_Ratboy : public RobotBase 
+{
+private:
+    bool m_moving_down = true; // Tracks vertical movement direction
+    int to_shoot_row = -1;   // Tracks the row of the next target to shoot
+    int to_shoot_col = -1;   // Tracks the column of the next target to shoot
+    
+    std::vector<RadarObj> known_obstacles; // Permanent obstacle list
+
+    // Helper function to determine if a cell is an obstacle
+    bool is_obstacle(int row, int col) const 
+    {
+        return std::any_of(known_obstacles.begin(), known_obstacles.end(), 
+                           [&](const RadarObj& obj) {
+                               return obj.m_row == row && obj.m_col == col;
+                           });
+    }
+
+    // Clears the target when no enemy is found
+    void clear_target() 
+    {
+        to_shoot_row = -1;
+        to_shoot_col = -1;
+    }
+
+    // Helper function to add an obstacle to the list if it's not already there
+    void add_obstacle(const RadarObj& obj) 
+    {
+        if (obj.m_type == 'M' || obj.m_type == 'P' || obj.m_type == 'F' && 
+            !is_obstacle(obj.m_row, obj.m_col)) 
+        {
+            known_obstacles.push_back(obj);
+        }
+    }
+
+public:
+    Robot_Ratboy() : RobotBase(3, 4, railgun) {} // Initialize with 3 movement, 4 armor, railgun
+
+    // Radar location for scanning in one of the 8 directions
+    virtual void get_radar_direction(int& radar_direction) override 
+    {
+        int current_row, current_col;
+        get_current_location(current_row, current_col);
+
+        // Decide radar direction
+        radar_direction = (current_col > 0) ? 7 : 3; // Left or Right
+    }
+
+    // Processes radar results and updates known obstacles and target
+    virtual void process_radar_results(const std::vector<RadarObj>& radar_results) override 
+    {
+        clear_target();
+
+        for (const auto& obj : radar_results) 
+        {
+            // Add static obstacles to the obstacle list
+            add_obstacle(obj);
+
+            // Identify the first enemy found as the target
+            if (obj.m_type == 'R' && to_shoot_row == -1 && to_shoot_col == -1) 
+            {
+                to_shoot_row = obj.m_row;
+                to_shoot_col = obj.m_col;
+            }
+        }
+    }
+
+    // Determines the next shot location
+    virtual bool get_shot_location(int& shot_row, int& shot_col) override 
+    {
+        if (to_shoot_row != -1 && to_shoot_col != -1) 
+        {
+            shot_row = to_shoot_row;
+            shot_col = to_shoot_col;
+            clear_target(); // Clear target after shooting
+            return true;
+        }
+        return false;
+    }
+
+    // Determines the next movement direction
+void get_move_direction(int& move_direction, int& move_distance) override 
+{
+    int current_row, current_col;
+    get_current_location(current_row, current_col);
+    int move = get_move_speed(); // Max movement range for this robot
+
+    // Step 1: Move left until column == 0
+    if (current_col > 0) 
+    {
+        move_direction = 7; // Left
+        move_distance = std::min(move, current_col); // Clamp to avoid going out of bounds
+        return;
+    }
+
+    // Step 2: Vertical movement once column == 0
+    if (m_moving_down) 
+    {
+        // Move down if not at the bottom
+        if (current_row + move < m_board_row_max) 
+        {
+            move_direction = 5; // Down
+            move_distance = std::min(move, m_board_row_max - current_row - 1);
+        } 
+        else 
+        {
+            // Switch to moving up
+            m_moving_down = false;
+            move_direction = 1; // Up
+            move_distance = 1;  // Take a single step up
+        }
+    } 
+    else 
+    {
+        // Move up if not at the top
+        if (current_row - move >= 0) 
+        {
+            move_direction = 1; // Up
+            move_distance = std::min(move, current_row);
+        } 
+        else 
+        {
+            // Switch to moving down
+            m_moving_down = true;
+            move_direction = 5; // Down
+            move_distance = 1;  // Take a single step down
+        }
+    }
+}
+
+};
+
+// Factory function to create Robot_Ratboy
+extern "C" RobotBase* create_robot() 
+{
+    return new Robot_Ratboy();
+}#include "RobotBase.h"
+#include <iostream>
+#include <string>
+#include <sstream>
+
+
+//overload the << operator to print the weapon type - handy.
+std::ostream& operator<<(std::ostream& os, const WeaponType& weapon)
+{
+    switch (weapon)
+    {
+        case flamethrower: os << "flamethrower"; break;
+        case railgun:      os << "railgun";      break;
+        case grenade:      os << "grenade";      break;
+        case hammer:       os << "hammer";       break;
+        default:           os << "unknown";      break;
+    }
+
+    return os;
+}
+
+// Constructor - Notice that you can't set move speed more than 5
+RobotBase::RobotBase(int move_in, int armor_in, WeaponType weapon_in)
+    : m_health(100), m_weapon(weapon_in), m_name("Blank_Robot")
+{
+    //set the number of starting grenades
+    m_grenades = 0;
+    if(weapon_in == grenade)
+    {
+        m_grenades = 15;
+    }
+
+
+    // Validate move input
+    if (move_in < 2)
+    {
+        m_move = 2;
+    }
+    else if (move_in > 5)
+    {
+        m_move = 5;
+    }
+    else
+    {
+        m_move = move_in;
+    }
+
+    // Calculate maximum armor based on the move value
+    int max_armor = 7 - m_move;
+
+    // Validate armor input
+    if (armor_in < 0)
+    {
+        m_armor = 0;
+    }
+    else if (armor_in > max_armor)
+    {
+        m_armor = max_armor;
+    }
+    else
+    {
+        m_armor = armor_in;
+    }
+
+    // blank out location
+    m_location_row = 0;
+    m_location_col = 0;
+
+}
+
+// Getters - because you're not allowed to manipulate the robots internal data directly.
+// this is a good example of why you need private member variables.
+
+// Get the robot's current health
+int RobotBase::get_health()
+{
+    return m_health;
+}
+
+// Get the robot's armor level
+int RobotBase::get_armor()
+{
+    return m_armor;
+}
+
+// Get the robot's movement range
+int RobotBase::get_move_speed()
+{
+    return m_move;
+}
+
+// Get the robot's weapon type
+WeaponType RobotBase::get_weapon()
+{
+    return m_weapon;
+}
+
+int RobotBase::get_grenades()
+{
+    return m_grenades;
+}
+
+void RobotBase::decrement_grenades()
+{
+    m_grenades--;
+    if(m_grenades < 0)
+        m_grenades = 0;
+
+}
+
+// Get the robot's current location
+void RobotBase::get_current_location(int& current_row, int& current_col)
+{
+    current_row = m_location_row;
+    current_col = m_location_col;
+}
+
+
+// Apply damage to the robot and reduce its health
+int RobotBase::take_damage(int damage_in)
+{
+    m_health -= damage_in;
+    if (m_health < 0)
+    {
+        m_health = 0; 
+    }
+    return m_health;
+}
+
+// Set the robot's next location
+void RobotBase::move_to(int new_row, int new_col)
+{
+    m_location_row = new_row;
+    m_location_col = new_col;
+}
+
+// Disable the robot's movement
+void RobotBase::disable_movement()
+{
+    m_move = 0;
+}
+
+void RobotBase::reduce_armor(int amount)
+{
+    m_armor = m_armor - amount;
+    if(m_armor < 0)
+        m_armor = 0;
+
+}
+
+//set the arena size
+void RobotBase::set_boundaries(int row_max, int col_max)
+{
+    m_board_row_max = row_max;
+    m_board_col_max = col_max;
+}
+
+std::string RobotBase::print_stats() const {
+
+    // Construct the robot's statistics as a string
+    std::ostringstream stats;
+    stats << m_name << ": ";
+    stats << "  H: " << m_health;
+    stats << "  W: " << m_weapon;
+    stats << "  A: " << m_armor;
+    stats << "  M: " << m_move;
+    stats << "  at: (" << m_location_row << "," << m_location_col << ") ";
+
+    return stats.str();
+}
+
+
+// Destructor
+RobotBase::~RobotBase()
+{
+    // No additional cleanup required
+}#include "Arena.h"
+
+int main() {
+    Arena a(20, 20);
+    a.loadAllRobots();
+    a.runSimulation();
+    return 0;
+}
+
+#include "RobotBase.h"
+#include <iostream>
+#include <vector>
+#include <dlfcn.h>
+#include <algorithm>
+
+RobotBase* load_robot(const std::string& shared_lib, void* &handle) 
+{
+    std::cout << "Testing robot from " << shared_lib << "...\n";
+
+    // Dynamically load the shared library
+    handle = dlopen(shared_lib.c_str(), RTLD_LAZY);
+    if (!handle) 
+    {
+        std::cerr << "Failed to load " << shared_lib << ": " << dlerror() << '\n';
+        return nullptr;
+    }
+
+    // Locate the create function to create the robot and 'assign' the function to this 'create_robot' function.
+    // RobotFactory is a function pointer type 'typedef'ed in RobotBase.h
+    RobotFactory create_robot = (RobotFactory)dlsym(handle, "create_robot");
+    if (!create_robot) 
+    {
+        std::cerr << "Failed to find create_robot in " << shared_lib << ": " << dlerror() << '\n';
+        dlclose(handle);
+        return nullptr;
+    }
+
+    // Instantiate the robot - it will need to be deleted later. This actually calls the function that exists
+    // in the ROBOT code! Cool huh! It's in the bottom of the Robot where it says extern "C"
+    RobotBase* robot = create_robot();
+    if (!robot) 
+    {
+        std::cerr << "Failed to create robot instance from " << shared_lib << '\n';
+        dlclose(handle);
+        return nullptr;
+    }
+
+    return robot;
+}
+
+// you can add or remove behaviors here if you like.
+// make a custom version of this tester, so that it tests YOUR robot...
+void test_robot_behavior(RobotBase* robot) 
+{
+    // Set up the robot
+    robot->set_boundaries(20, 20);
+    robot->move_to(10, 10); // Start in the middle of the arena
+
+    // Print robot stats
+    std::cout << "Robot Stats:" << std::endl;
+    robot->print_stats();
+
+    int inactive_turns = 0;
+
+    for (int turn = 1; turn <= 10; ++turn) {
+        std::cout << "\nSimulating turn " << turn << ":\n";
+
+        bool took_action = false;
+
+        // Simulate radar results
+        std::vector<RadarObj> radar_results;
+        int radar_direction = 0;
+
+        // Call get_radar_direction and simulate radar scanning
+        robot->get_radar_direction(radar_direction);
+        std::cout << "Radar direction chosen: " << radar_direction << std::endl;
+
+        if (turn == 2) {
+            // Simulate detecting an enemy on turn 2
+            RadarObj enemy('R', 10, 11);
+            radar_results.push_back(enemy);
+        }
+
+        // Pass radar results to the robot
+        robot->process_radar_results(radar_results);
+
+        int shot_row = 0, shot_col = 0;
+        if (robot->get_shot_location(shot_row, shot_col)) {
+            std::cout << "Robot shoots at (" << shot_row << ", " << shot_col << ").\n";
+            if (!radar_results.empty()) {
+                const auto& enemy = radar_results[0];
+                if (shot_row == enemy.m_row && shot_col == enemy.m_col) {
+                    std::cout << "Shot location matches radar target: (" << enemy.m_row << ", " << enemy.m_col << ").\n";
+                } else {
+                    std::cerr << "Error: Shot location (" << shot_row << ", " << shot_col
+                              << ") does not match radar target (" << enemy.m_row << ", " << enemy.m_col << ").\n";
+                }
+            }
+            took_action = true;
+        } else {
+            std::cout << "No shooting this turn.\n";
+        }
+
+        // Simulate movement
+        int move_direction = 0, move_distance = 0;
+        robot->get_move_direction(move_direction, move_distance);
+
+        if (move_direction != 0 && move_distance != 0) 
+        {
+            // Predefined directional increments for movement (1-8, clock directions) come from RobotBase
+            int delta_row = directions[move_direction].first;
+            int delta_col = directions[move_direction].second;
+
+            // Calculate new position
+            int current_row, current_col;
+            robot->get_current_location(current_row, current_col);
+            int target_row = std::clamp(current_row + delta_row * move_distance, 0, 19);
+            int target_col = std::clamp(current_col + delta_col * move_distance, 0, 19);
+
+            // Move the robot
+            robot->move_to(target_row, target_col);
+
+            std::cout << "Robot moves to (" << target_row << ", " << target_col << ").\n";
+
+            // Verify the movement
+            int verify_row, verify_col;
+            robot->get_current_location(verify_row, verify_col);
+            if (verify_row == target_row && verify_col == target_col) {
+                std::cout << "Movement verified!\n";
+            } else {
+                std::cerr << "Error: Robot did not move to the expected location!\n";
+            }
+
+            took_action = true;
+        } else {
+            std::cout << "Robot chooses not to move.\n";
+        }
+
+        // Check for inactivity
+        if (took_action) {
+            inactive_turns = 0; // Reset inactivity counter
+        } else {
+            ++inactive_turns;
+            if (inactive_turns >= 5) {
+                std::cerr << "Warning: Robot has not moved or shot for " << inactive_turns << " consecutive turns.\n";
+            }
+        }
+    }
+}
+
+
+
+int main(int argc, char* argv[]) 
+{
+    //argv[1] should contain the name of the Robot_.cpp file to load.
+
+    if (argc != 2) 
+    {
+        std::cerr << "Usage: " << argv[0] << " <robot_library>\n";
+        return 1;
+    }
+
+    const std::string robot_file = argv[1];
+    const std::string shared_lib = "lib" + robot_file.substr(0, robot_file.find(".cpp")) + ".so";
+
+    // Compile the robot into a shared library -fPIC is Position Independant Code - look it up!
+    // we're also linking a pre-compiled RobotBase.o - problems will arise if there is a mismatch...
+    std::string compile_cmd = "g++ -shared -fPIC -o " + shared_lib + " " + robot_file + " RobotBase.o -I. -std=c++20";
+    std::cout << "Compiling " << robot_file << " into " << shared_lib << "...\n";
+
+    if (std::system(compile_cmd.c_str()) != 0) {
+        std::cerr << "Failed to compile " << robot_file << " into " << shared_lib << '\n';
+        return 1;
+    }
+
+    std::cout << "Success!" << std::endl;
+
+    RobotBase *robot;
+    void *handle;
+
+    robot = load_robot(shared_lib, handle);
+    test_robot_behavior(robot);
+
+    // Cleanup
+    delete robot;
+    dlclose(handle);
+
+    std::cout << "Robot testing complete.\n";
+
+    return 0;
+}
+#pragma once
+#include <vector>
+#include <string>
+#include <dlfcn.h>
+#include "RobotBase.h"
+#include "RadarObj.h"
+
+// Obstacles
+enum class ObstacleType { Empty, FlameTrap, Pit, Mound };
+
+struct LoadedRobot {
+    RobotBase* robot = nullptr;
+    void* handle = nullptr;     // dlopen handle
+    int row = 0, col = 0;
+    bool alive = true;
+};
+
+class Arena {
+public:
+    Arena(int rows = 20, int cols = 20);
+    ~Arena();
+
+    void loadAllRobots();
+    void runSimulation();
+
+
+private:
+    int m_rows, m_cols;
+    std::vector<std::vector<ObstacleType>> board;
+    std::vector<LoadedRobot> robots;
+
+    void placeObstacles();
+    void placeRobotsRandomly();
+
+    std::vector<RadarObj> buildRadar(const LoadedRobot& lr) const;
+
+    void doMovement(LoadedRobot& lr);
+    void doShooting(LoadedRobot& lr);
+
+    void applyDamage(LoadedRobot& target, WeaponType w);
+    bool inBounds(int r, int c) const;
+
+    LoadedRobot* robotAt(int r, int c);
+    const LoadedRobot* robotAt(int r, int c) const; 
+
+    void printBoard(int round) const;
+    bool gameOver() const;
+
+
+
+};
+
+#pragma once
+
+// This represents a 'cell' in the board. it contains the 'char' indicating what is at that location
+// and the row and column. That's it. Don't add to this or change it and everyone's robots can work together.
+struct RadarObj 
+{
+
+    char m_type;  // 'X', 'R', 'M', 'F', 'P' (Dead Robot, Live Robot, Mound, Flamethrower, Pit)
+    int m_row;    // Row of the object
+    int m_col;    // Column of the object
+
+    // default constructor so you can make an empty one and fill it.
+    RadarObj() {} 
+    RadarObj(char type, int row, int col) : m_type(type), m_row(row), m_col(col) {}
+};#pragma once
+
+#include <string>
+#include <iostream>
+#include <vector>
+#include <utility>
+
+#include "RadarObj.h"
+
+// this works for both movement and radar checks
+constexpr std::pair<int, int> directions[] = 
+{
+    {0, 0},   // index 0 - placeholder
+    {-1, 0},  // 1: Up
+    {-1, 1},  // 2: Up-right
+    {0, 1},   // 3: Right
+    {1, 1},   // 4: Down-right
+    {1, 0},   // 5: Down
+    {1, -1},  // 6: Down-left
+    {0, -1},  // 7: Left
+    {-1, -1}  // 8: Up-left
+};
+
+// read about enums these are really just ints. 0-3.
+enum WeaponType { flamethrower, railgun, grenade, hammer };
+
+// don't change anything in here. Understand it though...
+class RobotBase 
+{
+private:
+    int m_health;
+    int m_armor;
+    int m_move;
+
+    WeaponType m_weapon;
+    int m_grenades;
+
+    int m_location_row;
+    int m_location_col;
+
+public:
+
+    int m_board_row_max;
+    int m_board_col_max;
+    std::string m_name;
+    char m_character;
+
+    RobotBase(int move_in, int armor_in, WeaponType weapon_in);
+
+    int get_health();
+    int get_armor();
+    int get_move_speed();
+    int get_grenades();
+    WeaponType get_weapon();
+    void set_boundaries(int row_max, int col_max);
+
+    // final methods (final means that these cannot be overridden)
+    virtual void get_current_location(int& current_row, int& current_col) final;
+    virtual int take_damage(int damage_in) final;
+    virtual void move_to(int new_row, int new_col) final;
+    virtual void disable_movement() final;
+    virtual void reduce_armor(int amount) final;
+    virtual void decrement_grenades() final;
+    virtual std::string print_stats() const  final;
+
+    // Pure virtual methods ( = 0 means that they must be implemented by derived classes)
+    virtual void get_radar_direction(int& radar_direction) = 0;
+    virtual void process_radar_results(const std::vector<RadarObj>& radar_results) = 0;
+    virtual bool get_shot_location(int& shot_row, int& shot_col) = 0;
+    virtual void get_move_direction(int &direction,int &distance) = 0;
+
+    // Virtual destructor
+    virtual ~RobotBase();
+};
+
+
+// to aid in the creation of the robots as shared objects.
+typedef RobotBase* (*RobotFactory)();
+
+
+CXX = g++
+CXXFLAGS = -std=c++20 -Wall -Wextra -pedantic
+
+OBJS = Arena.o Board.o RobotBase.o
+
+all: RobotWarz
+
+RobotBase.o: RobotBase.cpp RobotBase.h
+	$(CXX) $(CXXFLAGS) -c RobotBase.cpp
+
+Arena.o: Arena.cpp Arena.h
+	$(CXX) $(CXXFLAGS) -c Arena.cpp
+
+RobotWarz.o: RobotWarz.cpp Arena.h
+	$(CXX) $(CXXFLAGS) -c RobotWarz.cpp
+
+RobotWarz: RobotWarz.o Arena.o RobotBase.o
+	$(CXX) $(CXXFLAGS) -ldl RobotWarz.o Arena.o RobotBase.o -o RobotWarz
+
+clean:
+	rm -f *.o *.so RobotWarz
+
