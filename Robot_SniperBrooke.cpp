@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-// Optional: uncomment if you still want debug logs
+// Optional debug
 // #include <iostream>
 
 class Robot_SniperBrooke : public RobotBase
@@ -19,7 +19,7 @@ private:
 
     int radar_direction = 1;      // Radar scanning direction (1-8)
     bool fixed_radar = false;     // Tracks whether radar is locked on a target
-    const int max_range = 20;     // Railgun can reach across the arena; use a big range
+    const int max_range = 20;     // Railgun range (big enough for arena)
 
     std::set<std::pair<int, int>> obstacles_memory; // Memory of obstacles
 
@@ -81,6 +81,11 @@ public:
     Robot_SniperBrooke() : RobotBase(0, 4, railgun)
     {
         std::srand(static_cast<unsigned int>(std::time(nullptr)));
+
+        // Give this robot an identity so it doesn't show as "Blank_Robot"
+        m_name = "SniperBrooke";   // will show in WINNER: ...
+        m_character = 'S';         // character on the board
+
         // std::cout << "[SniperBrooke] constructed\n";
     }
 
